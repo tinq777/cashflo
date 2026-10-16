@@ -1,7 +1,13 @@
+<!doctype html>
+<html lang="en-AU">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Cashflo</title>
 <meta name="claude:viewport-fit-sides" content="cover">
 <meta name="theme-color" content="#0f6f62">
 <meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
 <meta name="apple-mobile-web-app-title" content="Cashflo">
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="icon" href="icon.svg" type="image/svg+xml">
@@ -35,6 +41,8 @@
 *{box-sizing:border-box}
 [hidden]{display:none!important}
 html,body{min-height:100%}
+html{-webkit-text-size-adjust:100%;text-size-adjust:100%}
+body{margin:0}
 body{background:var(--bg);color:var(--ink);font-family:var(--font-body);font-size:15px;line-height:1.45;-webkit-font-smoothing:antialiased}
 body::before{content:"";position:fixed;inset:0 0 auto;height:env(safe-area-inset-top,0px);z-index:30;background:var(--surface)}
 button,input,select,textarea{font:inherit;color:inherit}
@@ -466,7 +474,8 @@ function insights(m){
     const base = {}; for (const pm of prev) { const s = monthStats(pm); for (const [k,v] of Object.entries(s.byCat)) base[k] = (base[k]||0) + v/prev.length; }
     const partial = m === curPeriod(), scale = partial ? periodDays(m) / Math.max(1, dayNum(todayISO()) - dayNum(periodStart(m)) + 1) : 1;
     for (const [k,v] of Object.entries(st.byCat)) {
-      const c = cat(k); if (c.type !== "flexible" || k === "uncat") continue;
+      const c = cat(k); if (c.type !== "flexible" || k === "uncat" || k === "cash") continue;
+      if (partial && dayNum(todayISO()) - dayNum(periodStart(m)) < 6) continue;
       const b = base[k] || 0, proj = v * scale;
       if (b > 0 && proj > b*1.25 && proj - b > 50) L.push({lv:"warn", t:`${c.name} is up ${Math.round((proj/b-1)*100)}%${partial?" on current pace":""}`, b: partial ? `${money(v)} so far this period, heading for ${money(proj)} vs your ${money(b)} average.` : `${money(v)} vs your ${money(b)} average.`, save:(proj-b)*12});
     }
@@ -586,7 +595,7 @@ function render(){
   document.querySelectorAll(".tab").forEach(b => b.setAttribute("aria-current", b.dataset.tab === UI.tab ? "page" : "false"));
   const unc = S.txns.filter(t => t.cat === "uncat").length; const dot = $("#uncDot"); dot.hidden = !unc; dot.textContent = unc > 99 ? "99+" : unc;
   const ms = monthsWithData();
-  if (!UI.month || (ms.length && !ms.includes(UI.month))) UI.month = ms.at(-1) || curPeriod();
+  if (!UI.month || (ms.length && !ms.includes(UI.month))) { const busy = ms.filter(x => S.txns.filter(t => periodOf(t.date) === x).length >= 5); UI.month = busy.at(-1) || ms.at(-1) || curPeriod(); }
   $("#mLabel").textContent = periodLabel(UI.month);
   $("#mPrev").disabled = !ms.length || UI.month <= ms[0]; $("#mNext").disabled = !ms.length || UI.month >= ms.at(-1);
   $("#month").hidden = UI.tab === "data" || UI.tab === "buckets";
@@ -849,7 +858,7 @@ function runImport(acct, clearSample){
   }
   S.mappings[pending.sig] = {map: pending.map, acct}; S.lastImport = Date.now();
   recategorize(); save(); closeSheet();
-  UI.month = monthsWithData().at(-1); UI.tab = "overview"; render();
+  UI.month = null; UI.tab = "overview"; render();
   toast(`Imported ${added}${dup ? `, skipped ${dup} already here` : ""}${bad ? `, ${bad} unreadable` : ""}.`);
 }
 
@@ -920,3 +929,5 @@ view.addEventListener("drop", e => { const d = e.target.closest("#drop"); if (d)
   if ("serviceWorker" in navigator && location.protocol === "https:" && !/claude\.ai$|claudeusercontent/.test(location.hostname)) navigator.serviceWorker.register("sw.js").catch(() => {});
 })();
 </script>
+
+</html>
