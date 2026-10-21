@@ -25,3 +25,7 @@ All your data stays in the browser on the device you use (IndexedDB). Use **Sett
 What AI receives: period totals, category totals, recurring bills, bucket targets, and merchant names when sorting. Never account numbers or your full transaction list.
 
 AI only works on your Cashflo site, not in the Claude preview.
+
+## Versions
+
+The version number lives in one place: `APP_VERSION` near the top of the script in `index.html`, with the release notes in `CHANGELOG` beside it. `build.sh` stamps that version into `sw.js`, so phones drop their offline copy and pick up the new release. You can see the version, release notes and an update check in **Settings → About Cashflo**.

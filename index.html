@@ -293,6 +293,17 @@ details summary{cursor:pointer;font-weight:600;font-size:.9rem;color:var(--accen
 
 <script>
 "use strict";
+/* ================= version ================= */
+const APP_VERSION = "2.3.0";   // build.sh copies this into sw.js so the offline cache updates with each release
+const CHANGELOG = [
+  ["2.3.0", "2026-10-21", ["Take-home pay calculator for you and your partner (tax, Medicare, HELP, super, deductions)", "Budget built on combined regular take-home pay", "Bonuses and share deposits flagged and kept out of the budget", "Version info and update check in Settings"]],
+  ["2.2.0", "2026-10-21", ["Rename, add and delete buckets", "Suggest a % for one bucket, with AI when connected"]],
+  ["2.1.0", "2026-10-21", ["New layout: Home, Activity, Add, Bills, Goals", "Money sorted into income, bills, spending and saved", "Tax debt (ATO) as a bill", "Pay periods start the day your salary lands", "AI money coach: pay review, bucket split, sorting merchants"]],
+  ["1.3.0", "2026-10-20", ["Add your own categories"]],
+  ["1.2.0", "2026-10-16", ["Cash spends and ATM withdrawals", "Import reminder", "Pay-cycle months", "Phone layout fix"]],
+  ["1.0.0", "2026-10-16", ["First version: CSV import, rules, bills, buckets, backup"]],
+];
+
 /* ================= helpers ================= */
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
@@ -396,7 +407,7 @@ const DEFAULT_BUCKETS = () => [
   {id:"car", name:"Car Residual", acct:"", kind:"goal", pct:null, target:29000, due:addDays(todayISO(), 730), balance:0},
   {id:"holiday", name:"Holiday", acct:"", kind:"goal", pct:null, target:10000, due:addDays(todayISO(), 365), balance:0},
 ];
-function freshState(){ return {v:3, txns:[], userRules:[], customCats:[], buckets:DEFAULT_BUCKETS(), hiddenRecurring:[], mappings:{}, accounts:{}, sample:false, startDay:15, salary:null, reviews:{}, ai:{url:"", token:""}, stepDone:{}, lastImport:null}; }
+function freshState(){ return {v:3, txns:[], userRules:[], customCats:[], buckets:DEFAULT_BUCKETS(), hiddenRecurring:[], mappings:{}, accounts:{}, sample:false, startDay:15, salary:null, earners:[], bonusDone:{}, reviews:{}, ai:{url:"", token:""}, stepDone:{}, lastImport:null}; }
 let S = null;
 const UI = { tab:"home", period:null, filter:"all", q:"", topKind:"spend", topAll:false, saveAll:false, busy:null, suggestion:null };
 
@@ -419,7 +430,7 @@ const isSavingsAcct = a => !!(S.accounts[a] && S.accounts[a].savings);
 function makeTxn(o){ const t = {...o, norm:norm(o.desc), key:merchantKey(o.desc), cat:"uncat", src:"default"}; applyRules(t, rules()); return t; }
 function applyRules(t, rs){
   if (t.src === "manual") return;
-  if (S.salary && t.amount > 0 && t.key === S.salary.key) { t.cat = "salary"; t.src = "salary"; return; }
+  if (t.amount > 0 && salaryKeys().has(t.key)) { t.cat = "salary"; t.src = "salary"; return; }
   const r = rs.find(r => ruleFits(t, r));
   if (r) { t.cat = r.cat; t.src = "rule"; } else { t.cat = t.amount > 0 ? "otherincome" : "uncat"; t.src = "default"; }
 }
@@ -498,16 +509,65 @@ const periodDays = k => dayNum(periodEnd(k)) - dayNum(k) + 1;
 const daysIn = k => Math.min(periodDays(k), dayNum(todayISO()) - dayNum(k) + 1);
 const periodsWithData = () => [...new Set(S.txns.map(t => periodOf(t.date)))].sort();
 
+/* ================= take-home pay (ATO resident rates) ================= */
+// Rates checked Oct 2026: brackets (16% band falls to 15% on 1 Jul 2026, 14% from 1 Jul 2027), LITO, 2% Medicare levy,
+// HELP marginal repayment system, super guarantee 12%, max contribution base $270,830, concessional cap $32,500 (2026-27).
+const curFY = (iso = todayISO()) => +iso.slice(5,7) >= 7 ? +iso.slice(0,4) : +iso.slice(0,4) - 1;  // 2026 = 2026-27
+const fyLabel = fy => `${fy}–${String(fy + 1).slice(2)}`;
+function bracketTax(ti, fy){
+  const low = fy <= 2024 ? 0.16 : fy === 2025 ? 0.16 : fy === 2026 ? 0.15 : 0.14;
+  const B = [[18200, 0], [45000, low], [135000, 0.30], [190000, 0.37], [Infinity, 0.45]];
+  let tax = 0, prev = 0; for (const [top, r] of B) { if (ti > prev) tax += (Math.min(ti, top) - prev) * r; prev = top; } return tax;
+}
+const lito = ti => ti <= 37500 ? 700 : ti <= 45000 ? 700 - 0.05 * (ti - 37500) : ti <= 66667 ? Math.max(0, 325 - 0.015 * (ti - 45000)) : 0;
+const medicareLevy = ti => ti <= 28011 ? 0 : ti <= 35013 ? 0.1 * (ti - 28011) : 0.02 * ti;   // low-income phase-in uses 2025–26 thresholds
+function helpRepay(ri, fy){
+  const T = fy >= 2026 ? [69528, 129717, 186050, 9028] : [67000, 125000, 179285, 8700];
+  return ri <= T[0] ? 0 : ri <= T[1] ? 0.15 * (ri - T[0]) : ri <= T[2] ? T[3] + 0.17 * (ri - T[1]) : 0.10 * ri;
+}
+const PER_YEAR = {monthly:12, fortnightly:26, weekly:52};
+function calcPay(e){
+  const fy = curFY(), sgR = (isFinite(parseFloat(e.sg)) ? +e.sg : 12) / 100, base = +e.base || 0;
+  const salary = e.inclSuper ? base / (1 + sgR) : base, sgAmt = Math.min(salary, 270830) * sgR;
+  const sac = +e.sacrifice || 0, pre = +e.preTax || 0, post = +e.postTax || 0;
+  const taxable = Math.max(0, salary - sac - pre);
+  const tax = Math.max(0, bracketTax(taxable, fy) - lito(taxable)), medicare = medicareLevy(taxable);
+  const help = e.help ? helpRepay(taxable + sac, fy) : 0;
+  const take = salary - sac - pre - tax - medicare - help - post, per = PER_YEAR[e.freq] || 12;
+  return {fy, salary, sgAmt, sac, pre, post, taxable, tax, medicare, help, take, per, perPay: take / per, monthly: take / 12, capOver: Math.max(0, sgAmt + sac - 32500)};
+}
+const activeEarners = () => (S.earners || []).filter(e => +e.base > 0);
+const salaryKeys = () => new Set([...(S.salary ? [S.salary.key] : []), ...(S.earners || []).map(e => e.key).filter(Boolean)]);
+function expectedPerPay(key){
+  const e = (S.earners || []).find(e => e.key === key && +e.base > 0); if (e) return {amt: calcPay(e).perPay, freq: e.freq || "monthly", e};
+  const ds = S.txns.filter(t => t.amount > 0 && t.key === key).map(t => t.amount); if (!ds.length) return null;
+  const c = salaryCandidates().find(c => c.key === key); return {amt: median(ds), freq: c ? c.freq : "monthly"};
+}
+// deposits above regular pay (bonus, shares sold through payroll, back pay) — kept out of the budget
+function bonusesIn(k){
+  const out = [];
+  for (const key of salaryKeys()) {
+    const ex = expectedPerPay(key); if (!ex || !ex.amt) continue;
+    const ds = S.txns.filter(t => t.amount > 0 && t.key === key && periodOf(t.date) === k);
+    if (ex.freq === "monthly") {
+      ds.sort((a, b) => Math.abs(a.amount - ex.amt) - Math.abs(b.amount - ex.amt));
+      ds.forEach((t, i) => { const extra = i === 0 ? t.amount - ex.amt : t.amount; if (extra > Math.max(100, ex.amt * 0.1)) out.push({t, extra, who: ex.e ? ex.e.name : titleCase(key)}); });
+    } else for (const t of ds) { const extra = t.amount - ex.amt; if (extra > Math.max(100, ex.amt * 0.1)) out.push({t, extra, who: ex.e ? ex.e.name : titleCase(key)}); }
+  }
+  return out;
+}
+
 /* ================= numbers ================= */
 let _st = {gen:-1, m:new Map()};
 function periodStats(k){
   if (_st.gen !== GEN) _st = {gen:GEN, m:new Map()};
   if (_st.m.has(k)) return _st.m.get(k);
+  const SK = salaryKeys();
   const r = {k, income:0, salary:0, bills:0, spend:0, saved:0, byCat:{}, byGroup:{}, cashOut:0, cashLogged:0, cashLoggedSplurge:0, n:0};
   for (const t of S.txns) {
     if (periodOf(t.date) !== k) continue;
     r.n++;
-    if (S.salary && t.amount > 0 && t.key === S.salary.key) r.salary += t.amount;
+    if (t.amount > 0 && SK.has(t.key)) r.salary += t.amount;
     const c = cat(t.cat), kind = KIND[c.type]; if (!kind) continue;
     if (kind === "income") { r.income += t.amount; continue; }
     const v = -t.amount;
@@ -523,6 +583,7 @@ function periodStats(k){
   r.splurge = r.cashTotal + (r.byCat.splurge || 0) - r.cashLoggedSplurge;
   r.everyday = r.bills + r.spend - r.splurge;
   r.out = r.bills + r.spend + r.saved; r.left = r.income - r.out;
+  r.bonuses = bonusesIn(k); r.bonus = r.bonuses.reduce((s, b) => s + b.extra, 0);
   _st.m.set(k, r); return r;
 }
 // the 3 most recent periods before k that have data (fewer if not available)
@@ -530,12 +591,13 @@ function basePeriods(k){ const ps = periodsWithData().filter(p => p < k && perio
 function avgStat(field, k = curPeriod()){ const ps = basePeriods(k); if (!ps.length) { const all = periodsWithData().filter(p => p !== curPeriod()); if (!all.length) return 0; return mean(all.slice(-3).map(p => periodStats(p)[field])); } return mean(ps.map(p => periodStats(p)[field])); }
 function usualByCat(k){ const ps = basePeriods(k), u = {}; for (const p of ps) for (const [id, v] of Object.entries(periodStats(p).byCat)) u[id] = (u[id]||0) + v/ps.length; return u; }
 function salaryBudget(){
+  const es = activeEarners(); if (es.length) return es.reduce((s, e) => s + calcPay(e).monthly, 0);
   periodStarts(); const ev = _ps.ev.slice(-3);
-  const amts = ev.map(k => periodStats(k).salary).filter(v => v > 0);
+  const amts = ev.map(k => { const st = periodStats(k); return st.salary - st.bonus; }).filter(v => v > 0);
   if (amts.length) return median(amts);
   return avgStat("income");
 }
-const budgetBasis = () => S.salary && _ps.ev.length ? "salary" : "income";
+const budgetBasis = () => activeEarners().length ? "take-home pay" : S.salary && _ps.ev.length ? "salary" : "income";
 
 /* ================= buckets ================= */
 const bucket = id => S.buckets.find(b => b.id === id);
@@ -632,8 +694,10 @@ function aiSummary(k){
   const cats = kind => Object.entries(st.byCat).filter(([id]) => kindOf(id) === kind && id !== "uncat").sort((a,b) => b[1]-a[1]).map(([id, v]) => ({category:cat(id).name, group:cat(id).group, amount:r0(v), usual_per_pay: usual[id] != null ? r0(usual[id]) : null}));
   return {
     period: `${periodTitle(k)} (${periodRange(k)})`, period_complete: k !== curPeriod(), days_into_period: daysIn(k), period_length_days: periodDays(k),
-    budget_basis: budgetBasis() === "salary" ? "monthly salary" : "average income", monthly_salary: r0(al.inc),
-    this_period: {money_in:r0(st.income), salary:r0(st.salary), bills:r0(st.bills), spending:r0(st.spend), saved_to_savings_accounts:r0(st.saved), left:r0(st.left), uncategorised:r0(st.byCat.uncat || 0)},
+    budget_basis: budgetBasis(), monthly_budget_income: r0(al.inc),
+    earners: activeEarners().map(e => { const c = calcPay(e); return {name:e.name, paid:e.freq || "monthly", take_home_per_month:r0(c.monthly), salary_sacrifice_per_year:r0(c.sac), after_tax_deductions_per_year:r0(c.post)}; }),
+    extra_pay_this_period_not_in_budget: r0(st.bonus),
+    this_period: {money_in:r0(st.income), regular_pay:r0(st.salary - st.bonus), bills:r0(st.bills), spending:r0(st.spend), saved_to_savings_accounts:r0(st.saved), left:r0(st.left), uncategorised:r0(st.byCat.uncat || 0)},
     usual_per_pay: {bills:r0(avgStat("bills", k)), spending:r0(avgStat("spend", k)), saved:r0(avgStat("saved", k))},
     bills_by_category: cats("bills"), spending_by_category: cats("spend").slice(0, 15),
     cash: {withdrawn:r0(st.cashOut), logged_spends:r0(st.cashLogged), note:"all cash counts toward the Splurge bucket"},
@@ -664,7 +728,7 @@ async function runAISplit(){
   try {
     const d = await askAI(`Suggest a percentage of monthly salary for each bucket.
 Rules: Expenses must cover usual bills plus everyday spending (cash and splurge are excluded and belong to Splurge). Splurge covers all cash. Goal buckets should reach their target by their due date where the salary allows; Rainy Day's target is months of bills + spending and it can drop to 0% once full. Percentages must total 100 or less. Use at most one decimal place. If everything can't fit, say which goal to stretch and by how much.
-Return JSON exactly like: {"buckets":[{"id":"bucket id","pct":number,"reason":"one short sentence"}],"summary":"2 sentences","warnings":["..."]}
+Return JSON exactly like: {"buckets":[{"id":"bucket id","pct":number (percent of monthly_budget_income),"reason":"one short sentence"}],"summary":"2 sentences","warnings":["..."]}
 
 DATA:
 ${JSON.stringify(aiSummary(curPeriod()))}`, 1400);
@@ -672,6 +736,18 @@ ${JSON.stringify(aiSummary(curPeriod()))}`, 1400);
     for (const x of d.buckets || []) if (ids.has(x.id) && isFinite(+x.pct)) rows[x.id] = {pct: Math.max(0, Math.round(+x.pct * 10) / 10), why: String(x.reason || "")};
     if (!Object.keys(rows).length) throw new Error("The AI reply wasn't in the expected format. Try again.");
     UI.suggestion = {src:"ai", rows, summary:String(d.summary || ""), warnings:(d.warnings || []).map(String)};
+  } catch (e) { toast(e.message); }
+  UI.busy = null; render();
+}
+async function runBonusAI(tid, amt){
+  UI.busy = "bonus"; render();
+  try {
+    const d = await askAI(`They received ${money(amt)} of extra pay (bonus or shares) on top of regular take-home pay. Suggest how to split it across their buckets, favouring goals that are behind and any high-cost debt or bills. You can keep a small amount for a treat.
+Return JSON exactly like: {"summary":"one sentence","split":[{"id":"bucket id","amount":number,"reason":"short"}]} with amounts adding up to ${Math.round(amt)}.
+
+DATA:
+${JSON.stringify(aiSummary(curPeriod()))}`, 700);
+    UI.bonusAI = {...(UI.bonusAI || {}), [tid]: d};
   } catch (e) { toast(e.message); }
   UI.busy = null; render();
 }
@@ -857,7 +933,7 @@ function vHome(){
   const segs = [["bills", st.bills], ["spend", st.spend], ["saved", Math.max(0, st.saved)]].filter(s => s[1] > 0);
   const nextPay = nextStart(k), toPay = dayNum(nextPay) - dayNum(todayISO());
   const exp = bucket("expenses"), target = exp && hasPct(exp) && al.inc ? al.inc * exp.pct / 100 : 0, eRatio = target ? st.everyday / target : 0, eCls = eRatio <= 0.95 ? "good" : eRatio <= 1.05 ? "warn" : "bad";
-  const payNote = partial ? (paidOn(k) ? `Paid ${fmtDate(k)}` : st.salary ? "" : "Pay not imported yet") : `${periodRange(k)}`;
+  const payNote = (partial ? (paidOn(k) ? `Paid ${fmtDate(k)}` : st.salary ? "" : "Pay not imported yet") : `${periodRange(k)}`) + (st.bonus ? ` · incl. ${money(st.bonus)} extra pay` : "");
   parts.push(`<div class="card hero"><div class="top-row"><div><div class="label">${partial ? "Left from this pay" : "Left over from this pay"}</div><div class="big ${over ? "neg" : ""}">${over ? "−" : ""}${money(Math.abs(st.left))}</div></div>
     <div style="text-align:right">${partial ? `<span class="pill acc">${toPay <= 0 ? "Pay due today" : `${plural(toPay, "day")} to pay day`}</span>` : `<span class="pill">Finished</span>`}<div class="small muted" style="margin-top:4px">${esc(payNote)}</div></div></div>
     <div class="split" role="img" aria-label="Where this pay went">${segs.map(([kd, v]) => `<i class="sw-${kd}" style="width:${(v/total*100).toFixed(2)}%" title="${KIND_LABEL[kd]} ${money(v)}"></i>`).join("")}${over ? `<i class="sw-over" style="width:${(-st.left/total*100).toFixed(2)}%" title="Over by ${money(-st.left)}"></i>` : `<i class="sw-left" style="flex:1"></i>`}</div>
@@ -869,6 +945,13 @@ function vHome(){
     </div>
     ${target ? `<div style="display:flex;flex-direction:column;gap:6px"><div class="line"><span>Everyday budget <span class="muted small">(bills + spending, not cash)</span></span><span class="num">${money(st.everyday)} <span class="muted">of ${money(target)}</span></span></div><div class="meter ${eCls}"><i style="width:${Math.min(100, eRatio*100).toFixed(1)}%"></i></div></div>` : ""}
   </div>`);
+  const openB = st.bonuses.filter(b => !(S.bonusDone || {})[b.t.id]);
+  for (const b of openB) { const goals = S.buckets.filter(x => x.kind === "goal"), ai = UI.bonusAI && UI.bonusAI[b.t.id];
+    parts.push(`<div class="card"><div class="card-h"><h2>Extra pay: ${money(b.extra)}</h2><span class="sub">${esc(b.who)} · ${fmtDate(b.t.date)}</span></div>
+      <p class="small">This landed on top of regular pay (a bonus, shares or back pay), so it isn't part of your budget. Give it a job before it gets spent.</p>
+      ${ai ? `<div class="banner" style="flex-direction:column;align-items:flex-start;gap:6px"><b>${esc(ai.summary || "")}</b>${(ai.split || []).map(x => `<span class="small">• ${esc(bucket(x.id) ? bucket(x.id).name : x.id)}: <span class="num">${money(+x.amount)}</span>${x.reason ? `, ${esc(x.reason)}` : ""}</span>`).join("")}</div>` : ""}
+      <p class="small muted">Moved it into a goal? Tap the goal to add it to that balance.</p>
+      <div class="actions" style="justify-content:flex-start">${goals.map(g => `<button class="btn small" data-act="bonusGoal" data-b="${esc(g.id)}" data-t="${esc(b.t.id)}" data-amt="${b.extra.toFixed(2)}">${esc(g.name)}</button>`).join("")}${aiReady() ? `<button class="btn small primary" data-act="bonusAI" data-t="${esc(b.t.id)}" data-amt="${b.extra.toFixed(2)}" ${UI.busy ? "disabled" : ""}>${UI.busy === "bonus" ? `<span class="spin"></span>Thinking…` : "Ask AI how to use it"}</button>` : ""}<button class="btn small link" data-act="bonusDone" data-t="${esc(b.t.id)}">Dismiss</button></div></div>`); }
   const H = headsUp(k);
   if (H.length) parts.push(`<div class="card"><div class="card-h"><h2>Heads up</h2></div><div class="steps">${H.map(h => `<div class="step"><span class="dot" style="background:var(--${h.lv === "bad" ? "bad" : h.lv === "warn" ? "warn" : "info"});justify-self:center"></span><div><b style="font-weight:500">${esc(h.t)}</b></div><button class="btn link small" data-go="${h.go}" ${h.f ? `data-filter="${h.f}"` : ""}>${esc(h.btn)}</button></div>`).join("")}</div></div>`);
   // top spending
@@ -982,7 +1065,7 @@ function vGoals(){
     return `<div class="card"><div class="bk-h"><div><h3><span style="display:inline-block;width:10px;height:10px;border-radius:3px;background:${BK_COLORS[i % BK_COLORS.length]};margin-right:8px"></span>${esc(b.name)}</h3><div class="acct">${esc(b.acct || "—")}</div></div><div style="display:flex;gap:6px;align-items:center">${status}<button class="btn small" data-act="editBk" data-id="${esc(b.id)}" aria-label="Edit ${esc(b.name)}">Edit</button></div></div>${meter}${fig}<div class="bk-fields">${pctField}${goalFields}</div></div>`;
   }).join("");
   const savedRatio = al.plannedSave ? st.saved / al.plannedSave : 0;
-  return `<div class="card"><div class="card-h"><h2>Your budget</h2><span class="sub num">${basis === "salary" ? `salary ${money(inc)}/mo` : `avg income ${money(inc)}/mo`}</span></div>
+  return `<div class="card"><div class="card-h"><h2>Your budget</h2><span class="sub num">${basis === "take-home pay" ? `take-home ${money(inc)}/mo` : basis === "salary" ? `salary ${money(inc)}/mo` : `avg income ${money(inc)}/mo`}</span></div>
     <div class="alloc" role="img" aria-label="How your ${basis} is split">${segs.map(s => `<i title="${esc(s.name)} ${money(s.v)}" style="width:${(s.v/scale*100).toFixed(2)}%;background:${s.c}"></i>`).join("")}${!over ? `<i style="flex:1;background:transparent"></i>` : ""}</div>
     <div class="alloc-key">${segs.map(s => `<span><i style="background:${s.c}"></i>${esc(s.name)} <span class="num muted">${money(s.v)}</span></span>`).join("")}</div>
     <div class="line"><span>${over ? `<b class="neg">Over by ${money(-al.unallocated)}/mo.</b> Stretch a goal or lower a %.` : `<b>${money(al.unallocated)}/mo</b> not given a job yet`}</span><span class="muted num">${Math.round(al.used / inc * 100)}% planned</span></div>
@@ -995,6 +1078,48 @@ function vGoals(){
     <p class="small muted">Suggestions are budgeting help based on your own numbers, not financial advice. For investing or mortgage strategy, talk to a licensed adviser.</p>`;
 }
 
+function vEarners(){
+  const es = S.earners || [], cands = salaryCandidates(), fy = curFY();
+  const row = (l, v, cls = "") => `<div class="line"><span class="${cls ? "" : "muted"}">${l}</span><span class="num ${cls}">${v}</span></div>`;
+  const card = (e, i) => {
+    const c = +e.base > 0 ? calcPay(e) : null, ex = e.key ? S.txns.filter(t => t.amount > 0 && t.key === e.key).sort((a, b) => a.date < b.date ? 1 : -1) : [];
+    const regular = c && ex.length ? ex.find(t => Math.abs(t.amount - c.perPay) <= c.perPay * 0.1) : null, diff = regular ? regular.amount - c.perPay : null;
+    const ai = UI.payAI && UI.payAI[e.id];
+    return `<div class="card" style="box-shadow:none;background:var(--sunk);border-color:transparent">
+      <div class="card-h"><input class="input" data-earn="${i}" data-f="name" value="${esc(e.name)}" maxlength="24" style="max-width:200px;font-weight:600" aria-label="Name"><button class="btn small" data-act="delEarner" data-i="${i}">Remove</button></div>
+      <div class="grid2">
+        <label class="field"><span>Base salary per year</span><input class="input num" type="number" inputmode="decimal" min="0" step="1000" data-earn="${i}" data-f="base" value="${e.base || ""}" placeholder="e.g. 160000"></label>
+        <label class="field"><span>That amount is</span><select class="select" data-earn="${i}" data-f="inclSuper"><option value="0" ${!e.inclSuper ? "selected" : ""}>Salary, plus super</option><option value="1" ${e.inclSuper ? "selected" : ""}>Package, incl. super</option></select></label>
+        <label class="field"><span>Paid</span><select class="select" data-earn="${i}" data-f="freq">${Object.keys(PER_YEAR).map(f => `<option value="${f}" ${(e.freq || "monthly") === f ? "selected" : ""}>${f[0].toUpperCase() + f.slice(1)}</option>`).join("")}</select></label>
+        <label class="field"><span>Employer super %</span><input class="input num" type="number" min="0" max="30" step="0.5" data-earn="${i}" data-f="sg" value="${isFinite(parseFloat(e.sg)) ? e.sg : 12}"></label>
+        <label class="field"><span>Salary sacrifice to super, per year</span><input class="input num" type="number" min="0" step="500" data-earn="${i}" data-f="sacrifice" value="${e.sacrifice || ""}" placeholder="0"></label>
+        <label class="field"><span>Other pre-tax deductions, per year</span><input class="input num" type="number" min="0" step="500" data-earn="${i}" data-f="preTax" value="${e.preTax || ""}" placeholder="e.g. novated lease"></label>
+        <label class="field"><span>After-tax deductions, per year</span><input class="input num" type="number" min="0" step="500" data-earn="${i}" data-f="postTax" value="${e.postTax || ""}" placeholder="e.g. employee share plan"></label>
+        <label class="field"><span>Pay lands in your import as</span><select class="select" data-earn="${i}" data-f="key"><option value="">Not linked</option>${cands.map(c => `<option value="${esc(c.key)}" ${e.key === c.key ? "selected" : ""}>${esc(c.name)} · ${money(c.typical)}</option>`).join("")}${e.key && !cands.some(c => c.key === e.key) ? `<option value="${esc(e.key)}" selected>${esc(titleCase(e.key))}</option>` : ""}</select></label>
+      </div>
+      <label class="chk"><input type="checkbox" data-earn="${i}" data-f="help" ${e.help ? "checked" : ""}><span>Has a HELP (HECS) debt</span></label>
+      <p class="small muted">Share plans: put contributions taken from your after-tax pay under after-tax deductions. If your plan is salary sacrificed, use pre-tax instead.</p>
+      ${c ? `<div style="display:flex;flex-direction:column;gap:4px;padding-top:4px;border-top:1px solid var(--line)">
+        ${row(e.inclSuper ? "Salary (package less super)" : "Salary", money(c.salary))}
+        ${row(`Employer super (${isFinite(parseFloat(e.sg)) ? e.sg : 12}%, on top)`, money(c.sgAmt))}
+        ${c.sac ? row("Salary sacrifice to super", "−" + money(c.sac)) : ""}${c.pre ? row("Other pre-tax deductions", "−" + money(c.pre)) : ""}
+        ${row(`Income tax (${fyLabel(fy)} rates)`, "−" + money(c.tax))}${row("Medicare levy (2%)", "−" + money(c.medicare))}
+        ${c.help ? row("HELP repayment", "−" + money(c.help)) : ""}${c.post ? row("After-tax deductions", "−" + money(c.post)) : ""}
+        ${row("<b>Take-home per year</b>", money(c.take), "pos")}
+        <div class="line"><b>Per ${({monthly:"month", fortnightly:"fortnight", weekly:"week"})[e.freq || "monthly"]}</b><b class="num big" style="font-size:1.4rem">${money(c.perPay)}</b></div>
+        ${c.capOver ? `<p class="small" style="color:var(--warn)">Employer super plus salary sacrifice is ${money(c.capOver)} over the ${money(32500)} concessional cap.</p>` : ""}
+        ${regular ? `<p class="small ${Math.abs(diff) > Math.max(20, c.perPay * 0.015) ? "" : "muted"}" ${Math.abs(diff) > Math.max(20, c.perPay * 0.015) ? `style="color:var(--warn)"` : ""}>Last regular pay landed ${fmtDate(regular.date)}: ${money(regular.amount, true)}${Math.abs(diff) > Math.max(20, c.perPay * 0.015) ? `, ${money(Math.abs(diff))} ${diff > 0 ? "more" : "less"} than calculated. Check your payslip for a deduction missing here.` : ", matches the calculation."}</p>` : ""}
+        ${aiReady() ? `<div><button class="btn small" data-act="payAI" data-i="${i}" ${UI.busy ? "disabled" : ""}>${UI.busy === "pay" + i ? `<span class="spin"></span>Checking…` : "Check with AI"}</button></div>` : ""}
+        ${ai ? `<div class="banner" style="flex-direction:column;align-items:flex-start;gap:6px"><b>${esc(ai.summary || "")}</b>${(ai.checks || []).map(x => `<span class="small">• ${esc(x)}</span>`).join("")}</div>` : ""}
+      </div>` : `<p class="small muted">Enter a base salary to see take-home pay.</p>`}
+    </div>`;
+  };
+  const tot = activeEarners().reduce((s, e) => s + calcPay(e).monthly, 0);
+  return `<div class="card" id="set-earners"><div class="card-h"><h2>Take-home pay</h2>${tot ? `<span class="sub num">${money(tot)}/mo combined</span>` : ""}</div>
+    <p class="small muted">Your budget is built on regular take-home pay. Bonuses and share sales that land on top are flagged and kept out of it. This is an estimate using ${fyLabel(fy)} ATO rates, not tax advice; it doesn't include the Medicare levy surcharge, fringe benefits or offsets other than the low income tax offset.</p>
+    ${es.map(card).join("")}
+    <div><button class="btn" data-act="addEarner">+ Add ${es.length ? "another person" : "your pay"}</button></div></div>`;
+}
 function vSettings(){
   const accts = {}; for (const t of S.txns) accts[t.acct] = (accts[t.acct]||0) + 1;
   const cands = salaryCandidates(), sal = S.salary, ev = (periodStarts(), _ps.ev);
@@ -1003,6 +1128,7 @@ function vSettings(){
     <label class="field"><span>Your salary deposit</span><select class="select" id="salSel"><option value="">None (use average income)</option>${cands.map(c => `<option value="${esc(c.key)}" ${sal && sal.key === c.key ? "selected" : ""}>${esc(c.name)} · ${money(c.typical)} ${c.freq}</option>`).join("")}${sal && !cands.some(c => c.key === sal.key) ? `<option value="${esc(sal.key)}" selected>${esc(sal.name)}</option>` : ""}</select></label>
     <p class="small muted">${sal ? `Each pay period starts the day this lands (last: ${ev.length ? fmtDate(ev.at(-1)) : "none yet"}). If it comes early on the 13th or 14th, the period starts then.` : "Pick the deposit that is your salary. Cashflo budgets from it and starts each pay period when it lands."}</p>
     <label class="field" style="max-width:360px"><span>Until your pay arrives, expect it on the</span><select class="select" id="startDay">${Array.from({length:28}, (_, i) => i + 1).map(d => `<option value="${d}" ${startDay() === d ? "selected" : ""}>${ord(d)} of the month</option>`).join("")}</select></label></div>
+  ${vEarners()}
   <div class="card" id="set-ai"><div class="card-h"><h2>AI money coach</h2><span class="pill ${aiReady() ? "good" : ""}">${aiReady() ? "Connected" : "Not set up"}</span></div>
     <p class="small muted">AI reviews each pay, suggests your bucket split and sorts merchants. It only receives summaries (category totals, bills, goals) and merchant names, never account numbers or your full transaction list.</p>
     <div class="grid2"><label class="field"><span>Worker address</span><input class="input" id="aiUrl" placeholder="https://cashflo-ai.yourname.workers.dev" value="${esc(S.ai.url)}" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
@@ -1026,7 +1152,13 @@ function vSettings(){
     <p class="small muted">Everything lives on this device only. Save a backup now and then, and use it to move Cashflo to another device.</p>
     <div class="actions" style="justify-content:flex-start"><button class="btn" data-act="exportDl">Download backup</button><button class="btn" data-act="exportCopy">Copy backup</button><button class="btn" data-act="restoreFile">Restore file</button><button class="btn" data-act="restorePaste">Restore text</button></div></div>
   <div class="card"><div class="card-h"><h2>Start over</h2></div><div class="actions" style="justify-content:flex-start">${S.sample ? `<button class="btn" data-act="clearSample">Remove sample data</button>` : `<button class="btn" data-act="loadSample">Load sample data</button>`}<button class="btn danger" data-act="reset">Delete everything</button></div></div>
-  <p class="small muted" style="text-align:center">Cashflo · data stays in this browser</p>`;
+  <div class="card" id="set-about"><div class="card-h"><h2>About Cashflo</h2><span class="pill acc">Version ${APP_VERSION}</span></div>
+    <div class="line"><span class="muted">Released</span><span>${fmtDateY(CHANGELOG[0][1])}</span></div>
+    <div class="line"><span class="muted">Data format</span><span>v${S.v}</span></div>
+    <div class="line"><span class="muted">Tax rates</span><span>${fyLabel(curFY())} ATO</span></div>
+    <div class="actions" style="justify-content:flex-start"><button class="btn" data-act="checkUpdate">${UI.updateReady ? "Update ready: reload" : "Check for updates"}</button></div>
+    <details><summary>What's new</summary><div style="display:flex;flex-direction:column;gap:10px;margin-top:10px">${CHANGELOG.map(([v, d, items]) => `<div><b>${v}</b> <span class="small muted">${fmtDateY(d)}</span><ul class="small" style="margin:4px 0 0;padding-left:18px">${items.map(x => `<li>${esc(x)}</li>`).join("")}</ul></div>`).join("")}</div></details></div>
+  <p class="small muted" style="text-align:center">Cashflo ${APP_VERSION} · data stays in this browser</p>`;
 }
 
 /* ================= sheets ================= */
@@ -1188,6 +1320,7 @@ ${JSON.stringify(aiSummary(curPeriod()))}`, 500); row = isFinite(+d.pct) ? Math.
 function setSalary(key){
   if (!key) { S.salary = null; S.salaryNo = [...new Set([...(S.salaryNo || []), ...salaryCandidates().map(c => c.key)])]; }
   else { const c = salaryCandidates().find(c => c.key === key); S.salary = {key, name: c ? c.name : titleCase(key), confirmed:true}; S.salaryNo = (S.salaryNo || []).filter(k => k !== key); }
+  if (S.earners && S.earners[0]) S.earners[0].key = key || "";
   recategorize(); save(); UI.period = null; render(); toast(key ? "Salary set. Pay periods now start when it lands." : "No salary set. Budget uses your average income.");
 }
 
@@ -1295,11 +1428,12 @@ function migrate(s){
   s.accounts ||= {}; s.reviews ||= {}; s.stepDone ||= {}; s.customCats ||= []; s.ai ||= {url:"", token:""};
   if ((s.v || 1) < 3) { const ids = new Set(s.buckets.map(b => b.id)); for (const b of DEFAULT_BUCKETS()) if (!ids.has(b.id)) s.buckets.push(b); }
   for (const id of CORE_BUCKETS) if (!s.buckets.some(b => b.id === id)) s.buckets.unshift(DEFAULT_BUCKETS().find(b => b.id === id));
+  s.earners ||= []; s.bonusDone ||= {};
   s.v = 3; return s;
 }
 
 /* ================= events ================= */
-let toastT = 0;
+let toastT = 0, SWREG = null;
 function toast(msg){ document.querySelector(".toast")?.remove(); const el = document.createElement("div"); el.className = "toast"; el.setAttribute("role","status"); el.textContent = msg; document.body.append(el); clearTimeout(toastT); toastT = setTimeout(() => el.remove(), 3800); }
 function go(tab, filter){ if (tab === "activity") { UI.filter = filter || "all"; UI.q = ""; } setTab(tab); }
 
@@ -1339,6 +1473,26 @@ view.addEventListener("click", async e => {
     catch { toast("Couldn't reach the worker. Check the address. AI works on your Cashflo site, not inside a preview."); }
     render();
   }
+  if (act === "addEarner") { S.earners ||= []; const first = !S.earners.length; S.earners.push({id:"e" + Date.now().toString(36), name: first ? "Tim" : "Partner", base:"", inclSuper:false, freq:"monthly", sg:12, sacrifice:"", preTax:"", postTax:"", help:false, key: first && S.salary ? S.salary.key : ""}); save(); render(); }
+  if (act === "delEarner") { const e = S.earners[+a.dataset.i]; confirmSheet(`Remove ${e.name}'s pay?`, "Your budget goes back to using the pay that lands in your account.", "Remove", () => { S.earners.splice(+a.dataset.i, 1); recategorize(); save(); render(); }, true); }
+  if (act === "payAI") { const i = +a.dataset.i, e = S.earners[i], c = calcPay(e); UI.busy = "pay" + i; render();
+    try { const d = await askAI(`Check this Australian take-home pay estimate for one employee (${fyLabel(c.fy)} tax year). Point out anything commonly missed that would change take-home pay (e.g. Medicare levy surcharge without private hospital cover, salary-packaged items, how employee share plans are taxed, HELP). Don't recalculate tax unless something is clearly wrong.
+Return JSON exactly like: {"summary":"one sentence","checks":["short point", "..."]} with at most 4 checks.
+
+DATA:
+${JSON.stringify({paid:e.freq, salary_basis: e.inclSuper ? "package including super" : "salary plus super", employer_super_pct:+e.sg || 12, salary:Math.round(c.salary), salary_sacrifice_super:c.sac, other_pre_tax:c.pre, after_tax_deductions:c.post, has_help_debt:!!e.help, taxable_income:Math.round(c.taxable), income_tax:Math.round(c.tax), medicare_levy:Math.round(c.medicare), help_repayment:Math.round(c.help), take_home_year:Math.round(c.take), take_home_per_pay:Math.round(c.perPay)})}`, 700);
+      UI.payAI = {...(UI.payAI || {}), [e.id]: d}; } catch (err) { toast(err.message); }
+    UI.busy = null; render(); }
+  if (act === "bonusGoal") { const bk = bucket(a.dataset.b), amt = +a.dataset.amt; if (bk && bk.kind === "goal") bk.balance = (+bk.balance || 0) + amt; S.bonusDone = {...(S.bonusDone || {}), [a.dataset.t]: a.dataset.b}; save(); render(); toast(bk && bk.kind === "goal" ? `${money(amt)} added to ${bk.name}.` : "Marked as done."); }
+  if (act === "bonusDone") { S.bonusDone = {...(S.bonusDone || {}), [a.dataset.t]: "done"}; save(); render(); }
+  if (act === "bonusAI") runBonusAI(a.dataset.t, +a.dataset.amt);
+  if (act === "checkUpdate") {
+    if (UI.updateReady) { UI.updateReady.postMessage?.("skip"); location.reload(); return; }
+    if (!SWREG) { toast(`You're on ${APP_VERSION}. Updates check automatically on your Cashflo site.`); return; }
+    a.disabled = true; a.innerHTML = `<span class="spin"></span>Checking…`;
+    try { await SWREG.update(); } catch {}
+    setTimeout(() => { if (SWREG.installing || SWREG.waiting) { UI.updateReady = SWREG.waiting || SWREG.installing; toast("A new version is ready. Tap Update ready to reload."); } else toast(`You're up to date (${APP_VERSION}).`); render(); }, 1500);
+  }
   if (act === "aiClear") { S.ai = {url:"", token:""}; save(); render(); toast("AI disconnected."); }
   if (act === "addBk") openBucketEditor();
   if (act === "editBk") openBucketEditor(a.dataset.id);
@@ -1367,6 +1521,10 @@ view.addEventListener("change", e => {
   if (el.id === "catSel") { UI.filter = el.value ? "c:" + el.value : "all"; render(); }
   if (el.id === "startDay") { S.startDay = +el.value; save(); UI.period = null; render(); toast(`Expected pay day set to the ${ord(S.startDay)}.`); }
   if (el.id === "salSel") setSalary(el.value);
+  if (el.dataset.earn !== undefined) { const i = +el.dataset.earn, f = el.dataset.f, e = S.earners[i];
+    e[f] = el.type === "checkbox" ? el.checked : f === "inclSuper" ? el.value === "1" : ["name","freq","key"].includes(f) ? el.value : (el.value === "" ? "" : +el.value);
+    if (f === "key" && i === 0) { if (el.value) { const c = salaryCandidates().find(c => c.key === el.value); S.salary = {key:el.value, name: c ? c.name : titleCase(el.value), confirmed:true}; } }
+    if (f === "key") recategorize(); save(); render(); }
   if (el.dataset.sav !== undefined) { const a = el.dataset.sav; S.accounts[a] = {...(S.accounts[a] || {}), savings: el.checked}; recategorize(); save(); render(); toast(el.checked ? `${a} counts as savings.` : `${a} is an everyday account.`); }
   const bk = el.dataset.bk; if (bk) { const b = bucket(bk), k = el.dataset.k, v = el.value; b[k] = k === "due" ? v : k === "pct" ? (v === "" ? null : +v) : +v; save(); render(); }
 });
@@ -1383,7 +1541,13 @@ view.addEventListener("drop", e => { const d = e.target.closest(".drop"); if (d)
     recategorize(); ensureSalary(); recategorize(); save();
   } else { S = freshState(); rebuildCats(); S.txns = sampleTxns(); S.sample = true; recategorize(); ensureSalary(); recategorize(); save(); }
   render();
-  if ("serviceWorker" in navigator && location.protocol === "https:" && !/claude\.ai$|claudeusercontent/.test(location.hostname)) navigator.serviceWorker.register("sw.js").catch(() => {});
+  if (S.seenVersion !== APP_VERSION) { if (S.seenVersion) setTimeout(() => toast(`Updated to Cashflo ${APP_VERSION}. See what's new in Settings.`), 600); S.seenVersion = APP_VERSION; save(); }
+  if ("serviceWorker" in navigator && location.protocol === "https:" && !/claude\.ai$|claudeusercontent/.test(location.hostname)) {
+    navigator.serviceWorker.register("sw.js").then(reg => {
+      SWREG = reg;
+      reg.addEventListener("updatefound", () => { const w = reg.installing; w && w.addEventListener("statechange", () => { if (w.state === "installed" && navigator.serviceWorker.controller) { UI.updateReady = w; toast("A new version of Cashflo is ready. Reload to use it."); if (UI.tab === "settings") render(); } }); });
+    }).catch(() => {});
+  }
 })();
 </script>
 
