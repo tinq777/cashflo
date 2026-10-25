@@ -4,7 +4,7 @@ Personal money app: import bank CSVs, see where each pay goes (bills, spending, 
 
 ## Deploy the app (Cloudflare Pages)
 
-Put these files in the `cashflo` folder of your GitHub repo and push. Pages redeploys on its own (no build command, output directory `cashflo`).
+The app is served by Cloudflare Pages at https://cashflo.pages.dev from the root of the `main` branch of `tinq777/cashflo` (no build command, output directory: root). Every push to `main` redeploys it, and Claude pushes each release directly.
 
 Files: `index.html`, `manifest.webmanifest`, `sw.js`, `icon.svg`, `icon-192.png`, `icon-512.png`, `worker.js` (not used by the page itself), `README.md`.
 
